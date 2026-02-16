@@ -9,300 +9,122 @@
 
 #define CAN_TX_PIN  GPIO_NUM_26
 #define CAN_RX_PIN  GPIO_NUM_32
-#define SERIAL_BAUD 115200
 
-static bool echo_on     = true;
-static bool linefeed_on = false;
-static bool headers_on  = true;
-static bool spaces_on   = true;
-static bool can_running = false;
-static int  protocol    = 6;
-
-bool startCAN(twai_timing_config_t *t_cfg) {
-    if (can_running) {
-        twai_stop();
-        twai_driver_uninstall();
-        can_running = false;
-        delay(50);
-    }
-    twai_general_config_t g_config =
-        TWAI_GENERAL_CONFIG_DEFAULT(CAN_TX_PIN, CAN_RX_PIN, TWAI_MODE_NORMAL);
-    twai_filter_config_t f_config = TWAI_FILTER_CONFIG_ACCEPT_ALL();
-
-    if (twai_driver_install(&g_config, t_cfg, &f_config) != ESP_OK) return false;
-    if (twai_start() != ESP_OK) {
-        twai_driver_uninstall();
-        return false;
-    }
-    can_running = true;
-    return true;
-}
-
-void sendReply(const String &msg) {
-    if (msg.length() > 0) {
-        Serial.print(msg);
-        Serial.print("\r");
-    }
-    Serial.print(">");
-}
-
-String canRequest(uint32_t tx_id, const uint8_t *data, uint8_t dlen,
-                  uint32_t rx_id, uint32_t timeout_ms = 300) {
-    if (!can_running) return "";
-
-    twai_message_t tx = {};
-    tx.identifier       = tx_id;
-    tx.data_length_code = 8;
-    tx.data[0] = dlen;
-    for (int i = 0; i < dlen && i < 7; i++) tx.data[i + 1] = data[i];
-    for (int i = dlen + 1; i < 8; i++) tx.data[i] = 0xCC;
-
-    if (twai_transmit(&tx, 0) != ESP_OK) return "CAN ERROR";
-
-    String result       = "";
-    unsigned long start = millis();
-    bool fc_sent        = false;
-    uint8_t sn_expected = 1;
-
-    while (millis() - start < timeout_ms) {
-        twai_message_t rx = {};
-        if (twai_receive(&rx, pdMS_TO_TICKS(20)) != ESP_OK) continue;
-
-        bool match = (rx.identifier == rx_id) ||
-                     (rx.identifier >= 0x7E8 && rx.identifier <= 0x7EF) ||
-                     (rx.identifier >= 0x740 && rx.identifier <= 0x7FF);
-        if (!match) continue;
-
-        M5.dis.fillpix(0xFFFF00);
-
-        uint8_t pci        = rx.data[0];
-        uint8_t frame_type = (pci >> 4) & 0x0F;
-
-        if (frame_type == 0) {
-            if (headers_on) {
-                char hdr[12];
-                snprintf(hdr, sizeof(hdr), "%03X ", (unsigned int)rx.identifier);
-                result += hdr;
-            }
-            for (int i = 0; i < rx.data_length_code; i++) {
-                char b[4];
-                snprintf(b, sizeof(b), spaces_on ? "%02X " : "%02X", rx.data[i]);
-                result += b;
-            }
-            result.trim();
-            result += "\r";
-            break;
-
-        } else if (frame_type == 1) {
-            if (headers_on) {
-                char hdr[12];
-                snprintf(hdr, sizeof(hdr), "%03X ", (unsigned int)rx.identifier);
-                result += hdr;
-            }
-            for (int i = 0; i < rx.data_length_code; i++) {
-                char b[4];
-                snprintf(b, sizeof(b), spaces_on ? "%02X " : "%02X", rx.data[i]);
-                result += b;
-            }
-            result.trim();
-            result += "\r";
-
-            if (!fc_sent) {
-                twai_message_t fc = {};
-                fc.identifier       = tx_id;
-                fc.data_length_code = 8;
-                fc.data[0] = 0x30;
-                fc.data[1] = 0x00;
-                fc.data[2] = 0x00;
-                for (int i = 3; i < 8; i++) fc.data[i] = 0xCC;
-                twai_transmit(&fc, 0);
-                fc_sent     = true;
-                sn_expected = 1;
-                timeout_ms  = 600;
-            }
-
-        } else if (frame_type == 2) {
-            uint8_t sn = pci & 0x0F;
-            if (sn == sn_expected) {
-                if (headers_on) {
-                    char hdr[12];
-                    snprintf(hdr, sizeof(hdr), "%03X ", (unsigned int)rx.identifier);
-                    result += hdr;
-                }
-                for (int i = 0; i < rx.data_length_code; i++) {
-                    char b[4];
-                    snprintf(b, sizeof(b), spaces_on ? "%02X " : "%02X", rx.data[i]);
-                    result += b;
-                }
-                result.trim();
-                result += "\r";
-                sn_expected = (sn_expected + 1) & 0x0F;
-            }
-        }
-    }
-
-    return result;
-}
-
-String dispatchCANCommand(const String &cmd) {
-    if (!can_running) return "CAN ERROR";
-
-    uint32_t tx_id   = 0x744;
-    uint32_t rx_id   = 0x74C;
-    uint8_t  data[7] = {0};
-    uint8_t  dlen    = 0;
-
-    int hash = cmd.indexOf('#');
-    if (hash > 0) {
-        tx_id = (uint32_t)strtoul(cmd.substring(0, hash).c_str(), nullptr, 16);
-        rx_id = tx_id + 8;
-        String hex = cmd.substring(hash + 1);
-        for (int i = 0; i + 1 < (int)hex.length() && dlen < 7; i += 2) {
-            data[dlen++] = (uint8_t)strtoul(hex.substring(i, i + 2).c_str(), nullptr, 16);
-        }
-    } else {
-        for (int i = 0; i + 1 < (int)cmd.length() && dlen < 7; i += 2) {
-            data[dlen++] = (uint8_t)strtoul(cmd.substring(i, i + 2).c_str(), nullptr, 16);
-        }
-        if (data[0] == 0x01 || data[0] == 0x09) {
-            tx_id = 0x7DF;
-            rx_id = 0x7E8;
-        }
-    }
-
-    if (dlen == 0) return "?";   // ← ADD THIS before canRequest()
-
-    String resp = canRequest(tx_id, data, dlen, rx_id);
-    if (resp.length() == 0) return "NO DATA";
-    return resp;
-}
-
-String handleAT(const String &cmd) {
-
-    if (cmd.startsWith("ST")) {
-        return "?";
-    }
-
-    if (cmd == "ATZ" || cmd == "ATWS") {
-        echo_on     = true;        // WAS false
-        linefeed_on = false;
-        headers_on  = true;
-        spaces_on   = true;
-        protocol    = 6;
-        return "ELM327 v1.5";
-    }
-
-    if (cmd == "ATI")   return "ELM327 v1.5";
-    if (cmd == "AT@1")  return "OBDII to RS232 Interpreter";
-    if (cmd == "AT@2")  return "?";
-    if (cmd == "ATRV")  return "12.0V";
-
-    if (cmd == "ATE0")  { echo_on = false;     return "OK"; }
-    if (cmd == "ATE1")  { echo_on = true;      return "OK"; }
-
-    if (cmd == "ATL0")  { linefeed_on = false; return "OK"; }
-    if (cmd == "ATL1")  { linefeed_on = true;  return "OK"; }
-
-    if (cmd == "ATH0")  { headers_on = false;  return "OK"; }
-    if (cmd == "ATH1")  { headers_on = true;   return "OK"; }
-
-    if (cmd == "ATS0")  { spaces_on = false;   return "OK"; }
-    if (cmd == "ATS1")  { spaces_on = true;    return "OK"; }
-
-    if (cmd == "ATAT0" || cmd == "ATAT1" || cmd == "ATAT2") return "OK";
-
-    if (cmd.startsWith("ATCFC")) return "OK";
-    if (cmd.startsWith("ATFC"))  return "OK";
-    if (cmd.startsWith("ATCA"))  return "OK";
-    if (cmd.startsWith("ATCM"))  return "OK";
-    if (cmd.startsWith("ATCF"))  return "OK";
-    if (cmd.startsWith("ATCP"))  return "OK";
-    if (cmd.startsWith("ATSH"))  return "OK";
-    if (cmd.startsWith("ATCEA")) return "OK";
-    if (cmd.startsWith("ATST"))  return "OK";
-
-    if (cmd.startsWith("ATSP")) {
-        protocol = (int)strtol(cmd.substring(4).c_str(), nullptr, 16);
-        twai_timing_config_t t500 = TWAI_TIMING_CONFIG_500KBITS();
-        twai_timing_config_t t250 = TWAI_TIMING_CONFIG_250KBITS();
-        switch (protocol) {
-            case 0:
-                if (!startCAN(&t500)) startCAN(&t250);
-                break;
-            case 6:
-            case 7:
-                startCAN(&t500);
-                break;
-            case 8:
-            case 9:
-                startCAN(&t250);
-                break;
-            default:
-                startCAN(&t500);
-                break;
-        }
-        return "OK";
-    }
-
-    if (cmd == "ATDP")  return "ISO 15765-4 (CAN 500/11)";
-    if (cmd == "ATDPN") return "A6";
-    if (cmd == "ATPC")  return "OK";
-
-    if (cmd == "ATM0" || cmd == "ATM1") return "OK";
-    if (cmd == "ATBD" || cmd == "ATLP") return "OK";
-
-    return "OK";
-}
+// State variables matching ELM327 defaults
+bool echo_on = true;
+bool headers_on = false;
+uint32_t current_sh = 0x744;
+uint32_t current_rx = 0x74C;
 
 void setup() {
+    M5.begin(true, false, true);
     Serial.begin(115200);
-    Serial.setTimeout(750);
-    Serial.flush();
-    while (Serial.available() > 0) Serial.read();
-
-    M5.begin(false, false, true);
-    M5.dis.fillpix(0x0000FF);
-
+    
+    // Setup CAN for Renault Zoe (500k)
+    twai_general_config_t g_cfg = TWAI_GENERAL_CONFIG_DEFAULT(CAN_TX_PIN, CAN_RX_PIN, TWAI_MODE_NORMAL);
     twai_timing_config_t t_cfg = TWAI_TIMING_CONFIG_500KBITS();
-    pinMode(CAN_RX_PIN, INPUT_PULLUP);
-    if (!startCAN(&t_cfg)) {
-        M5.dis.fillpix(0xFF0000); // Red = CAN init failed
-    } else {
-        M5.dis.fillpix(0x00FF00);
-    }
+    twai_filter_config_t f_cfg = TWAI_FILTER_CONFIG_ACCEPT_ALL();
+    twai_driver_install(&g_cfg, &t_cfg, &f_cfg);
+    twai_start();
 
-    // FIX 2: Send the initial prompt so DDT4ALL doesn't time out on first ATZ
-    Serial.print(">");
+    M5.dis.fillpix(0x00FF00); // Green = Ready
+    Serial.print("\r\nELM327 v1.5\r\n>"); 
 }
 
 void loop() {
-    M5.update();
+    if (Serial.available()) {
+        String cmd = Serial.readStringUntil('\r');
+        cmd.trim();
+        if (cmd.length() == 0) {
+            Serial.print("\r>");
+            return;
+        }
 
-    if (!Serial.available()) return;
+        // 1. Handle ECHO (Must be exactly what was sent + \r)
+        if (echo_on) {
+            Serial.print(cmd + "\r");
+        }
 
-    String cmd = Serial.readStringUntil('\r');
-    cmd.replace("\n", "");
-    cmd.trim();
-    
-    if (cmd.length() == 0) return;
+        String upCmd = cmd;
+        upCmd.toUpperCase();
+        upCmd.replace(" ", "");
 
-    if (echo_on) {
-        Serial.print(cmd + "\r");  // echo the original mixed-case command
+        // 2. Handle AT Commands
+        if (upCmd.startsWith("AT")) {
+            if (upCmd == "ATZ" || upCmd == "ATWS") {
+                echo_on = true; headers_on = false;
+                current_sh = 0x744; current_rx = 0x74C;
+                Serial.print("ELM327 v1.5\r");
+            } 
+            else if (upCmd == "ATI" || upCmd == "AT@1") Serial.print("ELM327 v1.5\r");
+            else if (upCmd == "ATRV") Serial.print("12.6V\r");
+            else if (upCmd == "ATDP") Serial.print("ISO 15765-4 (CAN 11/500)\r");
+            else if (upCmd == "ATDPN") Serial.print("6\r");
+            else if (upCmd.startsWith("ATE")) { echo_on = (upCmd.endsWith("1")); Serial.print("OK\r"); }
+            else if (upCmd.startsWith("ATH")) { headers_on = (upCmd.endsWith("1")); Serial.print("OK\r"); }
+            else if (upCmd.startsWith("ATSH")) {
+                current_sh = strtoul(upCmd.substring(4).c_str(), NULL, 16);
+                current_rx = current_sh + 8; // Auto-set RX
+                Serial.print("OK\r");
+            }
+            else if (upCmd.startsWith("ATCRA")) {
+                current_rx = strtoul(upCmd.substring(5).c_str(), NULL, 16);
+                Serial.print("OK\r");
+            }
+            else {
+                Serial.print("OK\r"); // Silence all other config AT commands
+            }
+        } 
+        // 3. Handle HEX Commands (CAN Requests)
+        else {
+            uint8_t payload[8];
+            int len = 0;
+            for (int i = 0; i < upCmd.length() && len < 8; i += 2) {
+                payload[len++] = (uint8_t)strtoul(upCmd.substring(i, i + 2).c_str(), NULL, 16);
+            }
+
+            if (len > 0) {
+                // Send CAN Frame
+                twai_message_t tx;
+                tx.identifier = current_sh;
+                tx.extd = 0;
+                tx.data_length_code = 8;
+                for (int i = 0; i < 8; i++) tx.data[i] = (i < len) ? payload[i] : 0xAA;
+                twai_transmit(&tx, pdMS_TO_TICKS(50));
+
+                // Listen for Response
+                unsigned long start = millis();
+                bool found = false;
+                while (millis() - start < 500) {
+                    twai_message_t rx;
+                    if (twai_receive(&rx, pdMS_TO_TICKS(10)) == ESP_OK) {
+                        if (rx.identifier == current_rx) {
+                            M5.dis.fillpix(0xFFFF00); // Flash yellow
+                            
+                            String response = "";
+                            if (headers_on) {
+                                char hdr[5];
+                                sprintf(hdr, "%03X", rx.identifier);
+                                response += String(hdr);
+                            }
+                            for (int i = 0; i < rx.data_length_code; i++) {
+                                char b[4];
+                                sprintf(b, "%02X", rx.data[i]);
+                                response += String(b);
+                                if (i < rx.data_length_code - 1) response += " ";
+                            }
+                            Serial.print(response + "\r");
+                            found = true;
+                            break;
+                        }
+                    }
+                }
+                if (!found) Serial.print("NO DATA\r");
+            }
+        }
+
+        // 4. Always end with the prompt
+        Serial.print(">");
+        M5.dis.fillpix(0x00FF00);
     }
-
-    cmd.toUpperCase();
-    M5.dis.fillpix(0x00FFFF);
-
-    String response;
-
-    if (cmd.startsWith("AT")) {
-        response = handleAT(cmd);
-    } else if (cmd == "?") {
-        response = "?";
-    } else {
-        response = dispatchCANCommand(cmd);
-    }
-
-    sendReply(response);
-    M5.dis.fillpix(0x00FF00);
 }
